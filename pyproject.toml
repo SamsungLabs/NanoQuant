@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanoquant"
+version = "0.1.0"
+description = "NanoQuant: Efficient Sub-1-Bit Quantization of Large Language Models"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+dependencies = [
+    "accelerate>=0.20.0",
+    "cut_cross_entropy>=25.1.1",
+    "datasets>=4.0.0",
+    "gemlite>=0.4.0",
+    "lm_eval>=0.4.9",
+    "loguru>=0.7.0",
+    "optimum>=1.27.0",
+    "torch>=2.6.0",
+    "tqdm>=4.60.0",
+    "transformers>=4.50.0",
+]
+
+[project.optional-dependencies]
+kernels = []
+dev = ["pytest", "ruff", "mypy"]
+
+[project.scripts]
+nanoquant = "nanoquant.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+nanoquant = ["kernel/**/*.cu", "kernel/**/*.cuh", "kernel/**/*.h", "kernel/**/*.cpp", "kernel/**/*.sh"]
