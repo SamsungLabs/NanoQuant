@@ -181,7 +181,6 @@ def unpack_binary_gemv(packed_tensor: torch.Tensor, original_shape: Tuple[int, i
     return (1 - 2 * unpacked).to(torch.int8)
 
 
-@torch.compile
 def pack_binary_marlin(
     weight: torch.Tensor,
     scale_in: torch.Tensor,
@@ -213,7 +212,6 @@ def pack_binary_marlin(
     return weight, scale_in, scale_out, workspace_size
 
 
-@torch.compile
 def pack_binary_marlin_fused(
     V_sign: torch.Tensor,
     U_sign: torch.Tensor,
