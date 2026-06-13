@@ -36,6 +36,9 @@ struct Vec {
     __device__ T& operator[](int i) {
         return elems[i];
     }
+    __device__ const T& operator[](int i) const {
+        return elems[i];
+    }
 };
 
 using I1 = Vec<int, 1>;
@@ -47,8 +50,10 @@ template<typename T> struct MarlinTraits;
 template<> struct MarlinTraits<half> {
     using Scalar = half;
     using Vec2 = half2;
+    static constexpr unsigned ONE_BITS = 0x3c003c00;
     static __device__ __forceinline__ Vec2 make_vec2(float a, float b) { return __halves2half2(__float2half(a), __float2half(b)); }
     static __device__ __forceinline__ Vec2 from_scalars(Scalar a, Scalar b) { return __halves2half2(a, b); }
+    static __device__ __forceinline__ Scalar from_float(float v) { return __float2half(fminf(fmaxf(v, -64504.0f), 64504.0f)); }
     static __device__ __forceinline__ float to_float(Scalar v) { return __half2float(v); }
     static __device__ __forceinline__ Vec2 mul2(Vec2 a, Vec2 b) { return __hmul2(a, b); }
     static __device__ __forceinline__ float get_low_float(Vec2 v) { return __low2float(v); }
@@ -70,8 +75,10 @@ template<> struct MarlinTraits<half> {
 template<> struct MarlinTraits<__nv_bfloat16> {
     using Scalar = __nv_bfloat16;
     using Vec2 = __nv_bfloat162;
+    static constexpr unsigned ONE_BITS = 0x3f803f80;
     static __device__ __forceinline__ Vec2 make_vec2(float a, float b) { return __halves2bfloat162(__float2bfloat16(a), __float2bfloat16(b)); }
     static __device__ __forceinline__ Vec2 from_scalars(Scalar a, Scalar b) { return __halves2bfloat162(a, b); }
+    static __device__ __forceinline__ Scalar from_float(float v) { return __float2bfloat16(v); }
     static __device__ __forceinline__ float to_float(Scalar v) { return __bfloat162float(v); }
     static __device__ __forceinline__ Vec2 mul2(Vec2 a, Vec2 b) { return __hmul2(a, b); }
     static __device__ __forceinline__ float get_low_float(Vec2 v) { return __bfloat162float(__low2bfloat16(v)); }
@@ -102,6 +109,14 @@ __device__ inline void cp_async4_pred(void* smem_ptr, const void* glob_ptr, bool
         "    setp.ne.b32 p, %0, 0;\n"
         "    @p cp.async.cg.shared.global [%1], [%2], %3;\n"
         "}\n" :: "r"((int)pred), "r"(smem), "l"(glob_ptr), "n"(BYTES)
+    );
+}
+
+__device__ inline void cp_async4(void* smem_ptr, const void* glob_ptr) {
+    const int BYTES = 16;
+    uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], %2;\n" :: "r"(smem), "l"(glob_ptr), "n"(BYTES)
     );
 }
 
@@ -142,11 +157,21 @@ __device__ inline void ldsm4(void* frag_ptr, const void* smem_ptr) {
 
 //
 template <typename T>
-__device__ inline Vec<typename MarlinTraits<T>::Vec2, 2> dequant_and_scale(unsigned q, Vec<typename MarlinTraits<T>::Vec2, 2>& frag_s, int idx) {
+__device__ inline Vec<typename MarlinTraits<T>::Vec2, 2> dequant_and_scale(unsigned q, const Vec<typename MarlinTraits<T>::Vec2, 2>& frag_s, int idx) {
     Vec<typename MarlinTraits<T>::Vec2, 2> frag_b;
     const unsigned SIGN_MASK = 0x80008000;
-    *reinterpret_cast<unsigned*>(&frag_b[0]) = *reinterpret_cast<unsigned*>(&frag_s[0]) ^ ((q << (idx * 2 + 0)) & SIGN_MASK);
-    *reinterpret_cast<unsigned*>(&frag_b[1]) = *reinterpret_cast<unsigned*>(&frag_s[1]) ^ ((q << (idx * 2 + 1)) & SIGN_MASK);
+    *reinterpret_cast<unsigned*>(&frag_b[0]) = *reinterpret_cast<const unsigned*>(&frag_s[0]) ^ ((q << (idx * 2 + 0)) & SIGN_MASK);
+    *reinterpret_cast<unsigned*>(&frag_b[1]) = *reinterpret_cast<const unsigned*>(&frag_s[1]) ^ ((q << (idx * 2 + 1)) & SIGN_MASK);
+    return frag_b;
+}
+
+template <typename T>
+__device__ inline Vec<typename MarlinTraits<T>::Vec2, 2> dequant_unit(unsigned q, int idx) {
+    Vec<typename MarlinTraits<T>::Vec2, 2> frag_b;
+    const unsigned SIGN_MASK = 0x80008000;
+    const unsigned ONE_BITS = MarlinTraits<T>::ONE_BITS;
+    *reinterpret_cast<unsigned*>(&frag_b[0]) = ONE_BITS ^ ((q << (idx * 2 + 0)) & SIGN_MASK);
+    *reinterpret_cast<unsigned*>(&frag_b[1]) = ONE_BITS ^ ((q << (idx * 2 + 1)) & SIGN_MASK);
     return frag_b;
 }
 
@@ -278,7 +303,7 @@ __device__ inline void Marlin_impl(
     constexpr int b_sh_stage = b_sh_stride * thread_k_blocks;
     constexpr int true_b_sh_stage = true_b_sh_stride * thread_k_blocks;
     constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
-    constexpr int true_b_sh_wr_iters = true_b_sh_stage / b_sh_wr_delta;
+    constexpr int true_b_sh_wr_iters = ceildiv(true_b_sh_stage, b_sh_wr_delta);
 
     constexpr int s_in_gl_stride = 16 * thread_k_blocks / 8;
     constexpr int s_in_sh_stride = s_in_gl_stride;
@@ -370,8 +395,14 @@ __device__ inline void Marlin_impl(
             int4* sh_b_stage = sh_b + true_b_sh_stage * pipe;
             #pragma unroll
             for (int i = 0; i < true_b_sh_wr_iters; i++) {
-                cp_async4_stream(
-                    &sh_b_stage[b_sh_wr_delta * i + b_sh_wr], B_ptr[i]);
+                if constexpr (true_b_sh_stage % b_sh_wr_delta == 0) {
+                    cp_async4(
+                        &sh_b_stage[b_sh_wr_delta * i + b_sh_wr], B_ptr[i]);
+                }
+                else if (b_sh_wr_delta * i + b_sh_wr < true_b_sh_stage) {
+                    cp_async4(
+                        &sh_b_stage[b_sh_wr_delta * i + b_sh_wr], B_ptr[i]);
+                }
                 B_ptr[i] += b_gl_rd_delta_o;
             }
             // copy input scales
@@ -413,19 +444,23 @@ __device__ inline void Marlin_impl(
     };
 
     auto matmul = [&](int k) {
+        int b_quant = frag_b_quant[k % 2][0];
+        Vec<TVec2, 2> scale;
+        if constexpr (use_s_in) {
+            scale = frag_s_in[k % 2];
+        }
         #pragma unroll
         for (int j = 0; j < 4; j++) {
-            int b_quant = frag_b_quant[k % 2][0];
-            Vec<TVec2, 2> scale;
-            if (use_s_in) {
-                scale = frag_s_in[k % 2];
+            Vec<TVec2, 2> frag_b0;
+            Vec<TVec2, 2> frag_b1;
+            if constexpr (use_s_in) {
+                frag_b0 = dequant_and_scale<T>(b_quant, scale, j * 2 + 0);
+                frag_b1 = dequant_and_scale<T>(b_quant, scale, j * 2 + 1);
             }
             else {
-                scale[0] = Traits::make_vec2(1.0f, 1.0f);
-                scale[1] = Traits::make_vec2(1.0f, 1.0f);
+                frag_b0 = dequant_unit<T>(b_quant, j * 2 + 0);
+                frag_b1 = dequant_unit<T>(b_quant, j * 2 + 1);
             }
-            auto frag_b0 = dequant_and_scale<T>(b_quant, scale, j * 2 + 0);
-            auto frag_b1 = dequant_and_scale<T>(b_quant, scale, j * 2 + 1);
             #pragma unroll
             for (int i = 0; i < thread_m_blocks; i++) {
                 Traits::mma(frag_a[k % 2][i], frag_b0, frag_c[i][j][0]);
@@ -514,7 +549,7 @@ __device__ inline void Marlin_impl(
                         int4 c;
                         #pragma unroll
                         for (int j = 0; j < 2 * 4; j++) {
-                            reinterpret_cast<T*>(&c)[j] = clamp_inf_for_half<T>(
+                            reinterpret_cast<T*>(&c)[j] = Traits::from_float(
                                 reinterpret_cast<float*>(&frag_c)[4 * 2 * 4 * (i / 4) + 4 * j + (i % 4)]
                             );
                         }
@@ -545,8 +580,8 @@ __device__ inline void Marlin_impl(
             float res_high = Traits::get_high_float(res);
             
             ((typename Traits::Vec2*)sh)[idx] = Traits::from_scalars(
-                clamp_inf_for_half<T>(res_low), 
-                clamp_inf_for_half<T>(res_high)
+                Traits::from_float(res_low),
+                Traits::from_float(res_high)
             );
         };
 
@@ -654,6 +689,11 @@ __device__ inline void Marlin_impl(
     }
 }
 
+const int ERR_PROB_SHAPE = 1;
+const int ERR_KERN_SHAPE = 2;
+const int THREADS = 256;
+const int STAGES = 4;
+
 // --- Kernel Wrappers ---
 template <
     typename T,
@@ -662,33 +702,72 @@ template <
     const int thread_n_blocks,
     const int thread_k_blocks,
     const int stages,
-    const bool use_s_in = true
+    const bool use_s_in = true,
+    const bool use_s_out = true
 >
 __global__ void Marlin_kernel(const int4* __restrict__ A, const int4* __restrict__ B, int4* __restrict__ C, const int4* __restrict__ s_in, const int4* __restrict__ s_out, int prob_m, int prob_n, int prob_k, int* locks) {
-    Marlin_impl<T, threads, thread_m_blocks, thread_n_blocks, thread_k_blocks, stages, use_s_in, true>(A, B, C, s_in, s_out, prob_m, prob_n, prob_k, locks);
+    Marlin_impl<T, threads, thread_m_blocks, thread_n_blocks, thread_k_blocks, stages, use_s_in, use_s_out>(A, B, C, s_in, s_out, prob_m, prob_n, prob_k, locks);
 }
 
-#define CALL_IF(T, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, USE_S_IN)    \
+template <
+    const int thread_m_blocks,
+    const int thread_n_blocks,
+    const int thread_k_blocks,
+    const int stages,
+    const bool use_s_in,
+    const bool use_s_out
+>
+constexpr int marlin_shared_mem_bytes() {
+    constexpr int a_sh_stride = 16 * thread_k_blocks / 8;
+    constexpr int a_sh_stage = a_sh_stride * (16 * thread_m_blocks);
+    constexpr int true_b_sh_stride = 2 * thread_n_blocks;
+    constexpr int true_b_sh_stage = true_b_sh_stride * thread_k_blocks;
+    constexpr int s_in_sh_stage = use_s_in ? (16 * thread_k_blocks / 8) : 0;
+    constexpr int s_out_sh_stage = use_s_out ? (16 * thread_n_blocks / 8) : 0;
+    constexpr int pipeline_int4 = stages * (a_sh_stage + true_b_sh_stage + s_in_sh_stage) + s_out_sh_stage;
+
+    constexpr int b_sh_stride = 32 * thread_n_blocks / 4;
+    constexpr int red_groups = THREADS / b_sh_stride;
+    constexpr int reduce_int4 = red_groups > 1 ? (8 * THREADS - b_sh_stride) : 0;
+
+    constexpr int active_threads = 32 * thread_n_blocks / 4;
+    constexpr int global_reduce_int4 = active_threads * thread_m_blocks * 4;
+
+    constexpr int c_sh_stride = 2 * thread_n_blocks + 1;
+    constexpr int max_writer_warp = thread_n_blocks / 4 - 1;
+    constexpr int max_c_sh_wr = (4 * c_sh_stride) * 7 + 3 + 32 * max_writer_warp;
+    constexpr int max_write_idx = max_c_sh_wr + 8 * 3 + (4 * c_sh_stride) * 8 + 4
+                                  + (thread_m_blocks - 1) * 16 * (4 * c_sh_stride);
+    constexpr int write_result_int4 = (max_write_idx + 4) / 4;
+
+    constexpr int scratch_int4 =
+        reduce_int4 > global_reduce_int4
+            ? (reduce_int4 > write_result_int4 ? reduce_int4 : write_result_int4)
+            : (global_reduce_int4 > write_result_int4 ? global_reduce_int4 : write_result_int4);
+    constexpr int smem_int4 = pipeline_int4 > scratch_int4 ? pipeline_int4 : scratch_int4;
+    return smem_int4 * static_cast<int>(sizeof(int4));
+}
+
+#define CALL_IF(T, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, USE_S_IN, USE_S_OUT) \
     else if (                                                                      \
         thread_m_blocks == THREAD_M_BLOCKS &&                                      \
         thread_n_blocks == THREAD_N_BLOCKS &&                                      \
         thread_k_blocks == THREAD_K_BLOCKS) {                                      \
-        cudaFuncSetAttribute(                                                      \
-            Marlin_kernel<T, THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, USE_S_IN>, \
-            cudaFuncAttributeMaxDynamicSharedMemorySize,                           \
-            SHARED_MEM);                                                           \
-        Marlin_kernel<T, THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, USE_S_IN> \
-            <<<blocks, THREADS, SHARED_MEM, stream>>>(                             \
+        constexpr int SHARED_MEM_BYTES = marlin_shared_mem_bytes<THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, USE_S_IN, USE_S_OUT>(); \
+        static bool attr_set = []() {                                              \
+            cudaFuncSetAttribute(                                                  \
+                Marlin_kernel<T, THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, USE_S_IN, USE_S_OUT>, \
+                cudaFuncAttributeMaxDynamicSharedMemorySize,                       \
+                SHARED_MEM_BYTES);                                                 \
+            return true;                                                           \
+        }();                                                                       \
+        (void)attr_set;                                                            \
+        Marlin_kernel<T, THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, USE_S_IN, USE_S_OUT> \
+            <<<blocks, THREADS, SHARED_MEM_BYTES, stream>>>(                       \
                 A_ptr, B_ptr, C_ptr, s_in_ptr, s_out_ptr,                          \
                 prob_m, prob_n, prob_k,                                            \
                 locks);                                                            \
     }
-
-const int ERR_PROB_SHAPE = 1;
-const int ERR_KERN_SHAPE = 2;
-const int THREADS = 256;
-const int STAGES = 4;
-const int SHARED_MEM = 96 * 1024;
 
 template <typename T>
 int marlin_cuda_template(
@@ -699,6 +778,7 @@ int marlin_cuda_template(
     int tot_m = prob_m;
     int tot_m_blocks = ceildiv(tot_m, 16);
     int pad = 16 * tot_m_blocks - tot_m;
+    max_par = max_par > 32 ? max_par : 32;
 
     if (sms == -1) {
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
@@ -708,6 +788,10 @@ int marlin_cuda_template(
         if (prob_m <= 16) {
             thread_k = 256;
             thread_n = 128;
+        }
+        else if (s_in == nullptr && prob_n >= 8192) {
+            thread_k = 128;
+            thread_n = 512;
         }
         else {
             thread_k = 128;
@@ -747,21 +831,41 @@ int marlin_cuda_template(
 
         // For compilation speed, we only define the kernel configurations that have seemed useful (in terms of performance)
         // in our testing, however many more are, in principle, possible.
-        if (s_in_ptr != nullptr) {
+        if (s_in_ptr != nullptr && s_out_ptr != nullptr) {
             if (false) {}
-            CALL_IF(T, 1, 8, 16, true)
-            CALL_IF(T, 1, 16, 8, true)
-            CALL_IF(T, 2, 16, 8, true)
-            CALL_IF(T, 3, 16, 8, true)
-            CALL_IF(T, 4, 16, 8, true)
+            CALL_IF(T, 1, 8, 16, true, true)
+            CALL_IF(T, 1, 16, 8, true, true)
+            CALL_IF(T, 2, 16, 8, true, true)
+            CALL_IF(T, 3, 16, 8, true, true)
+            CALL_IF(T, 4, 16, 8, true, true)
+            else ret = ERR_KERN_SHAPE;
+        } else if (s_in_ptr != nullptr) {
+            if (false) {}
+            CALL_IF(T, 1, 8, 16, true, false)
+            CALL_IF(T, 1, 16, 8, true, false)
+            CALL_IF(T, 2, 16, 8, true, false)
+            CALL_IF(T, 3, 16, 8, true, false)
+            CALL_IF(T, 4, 16, 8, true, false)
+            else ret = ERR_KERN_SHAPE;
+        } else if (s_out_ptr != nullptr) {
+            if (false) {}
+            CALL_IF(T, 1, 8, 16, false, true)
+            CALL_IF(T, 1, 16, 8, false, true)
+            CALL_IF(T, 2, 16, 8, false, true)
+            CALL_IF(T, 3, 16, 8, false, true)
+            CALL_IF(T, 4, 16, 8, false, true)
+            CALL_IF(T, 1, 32, 8, false, true)
+            CALL_IF(T, 2, 32, 8, false, true)
+            CALL_IF(T, 3, 32, 8, false, true)
+            CALL_IF(T, 4, 32, 8, false, true)
             else ret = ERR_KERN_SHAPE;
         } else {
             if (false) {}
-            CALL_IF(T, 1, 8, 16, false)
-            CALL_IF(T, 1, 16, 8, false)
-            CALL_IF(T, 2, 16, 8, false)
-            CALL_IF(T, 3, 16, 8, false)
-            CALL_IF(T, 4, 16, 8, false)
+            CALL_IF(T, 1, 8, 16, false, false)
+            CALL_IF(T, 1, 16, 8, false, false)
+            CALL_IF(T, 2, 16, 8, false, false)
+            CALL_IF(T, 3, 16, 8, false, false)
+            CALL_IF(T, 4, 16, 8, false, false)
             else ret = ERR_KERN_SHAPE;
         }
 
