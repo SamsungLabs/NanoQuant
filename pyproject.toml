@@ -19,7 +19,8 @@ dependencies = [
     "optimum>=1.27.0",
     "torch>=2.6.0",
     "tqdm>=4.60.0",
-    "transformers>=4.50.0",
+    "transformers==4.51.3",
+    "zeus-ml",
 ]
 
 [project.optional-dependencies]
