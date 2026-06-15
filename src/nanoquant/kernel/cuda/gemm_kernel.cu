@@ -27,6 +27,10 @@ constexpr int ceildiv(int a, int b) {
     return (a + b - 1) / b;
 }
 
+constexpr int max_int(int a, int b) {
+    return a > b ? a : b;
+}
+
 // Instances of `Vec` are used to organize groups of >>registers<<, as needed for instance as inputs to tensor core
 // operations. Consequently, all corresponding index accesses must be compile-time constants, which is why we
 // extensively use `#pragma unroll` throughout the kernel code to guarantee this.
@@ -43,6 +47,70 @@ struct Vec {
 
 using I1 = Vec<int, 1>;
 using FragC = Vec<float, 4>;
+
+template <
+    const int threads,
+    const int thread_m_blocks,
+    const int thread_n_blocks,
+    const int thread_k_blocks,
+    const int stages,
+    const bool use_s_in,
+    const bool use_s_out
+>
+struct MarlinSharedMemLayout {
+    static_assert(thread_n_blocks % 4 == 0, "thread_n_blocks must be a multiple of 4");
+
+    static constexpr int a_sh_stride = 16 * thread_k_blocks / 8;
+    static constexpr int a_sh_stage = a_sh_stride * (16 * thread_m_blocks);
+
+    static constexpr int b_sh_stride = 32 * thread_n_blocks / 4;
+    static constexpr int true_b_sh_stride = 2 * thread_n_blocks;
+    static constexpr int true_b_sh_stage = true_b_sh_stride * thread_k_blocks;
+
+    static constexpr int s_in_sh_stride = 16 * thread_k_blocks / 8;
+    static constexpr int s_in_sh_stage = use_s_in ? s_in_sh_stride : 0;
+    static constexpr int s_out_sh_stride = 16 * thread_n_blocks / 8;
+    static constexpr int s_out_sh_stage = use_s_out ? s_out_sh_stride : 0;
+
+    static constexpr int a_offset_int4 = 0;
+    static constexpr int b_offset_int4 = a_offset_int4 + stages * a_sh_stage;
+    static constexpr int s_in_offset_int4 = b_offset_int4 + stages * true_b_sh_stage;
+    static constexpr int s_out_offset_int4 = s_in_offset_int4 + stages * s_in_sh_stage;
+    static constexpr int pipeline_int4 = s_out_offset_int4 + s_out_sh_stage;
+
+    static constexpr int red_groups = threads / b_sh_stride;
+    static constexpr int reduce_int4 = red_groups > 1 ? (8 * threads - b_sh_stride) : 0;
+
+    static constexpr int active_threads = 32 * thread_n_blocks / 4;
+    static constexpr int global_reduce_int4 = active_threads * thread_m_blocks * 4;
+
+    static constexpr int c_sh_stride = 2 * thread_n_blocks + 1;
+    static constexpr int max_writer_warp = thread_n_blocks / 4 - 1;
+    static constexpr int max_c_sh_wr = (4 * c_sh_stride) * 7 + 3 + 32 * max_writer_warp;
+    static constexpr int max_write_idx = max_c_sh_wr + 8 * 3 + (4 * c_sh_stride) * 8 + 4
+                                        + (thread_m_blocks - 1) * 16 * (4 * c_sh_stride);
+    static constexpr int write_result_int4 = (max_write_idx + 4) / 4;
+
+    static constexpr int scratch_int4 =
+        max_int(max_int(reduce_int4, global_reduce_int4), write_result_int4);
+    static constexpr int smem_int4 = max_int(pipeline_int4, scratch_int4);
+    static constexpr int bytes = smem_int4 * static_cast<int>(sizeof(int4));
+
+    static constexpr bool covers_pipeline = smem_int4 >= pipeline_int4;
+    static constexpr bool covers_reduce = smem_int4 >= reduce_int4;
+    static constexpr bool covers_global_reduce = smem_int4 >= global_reduce_int4;
+    static constexpr bool covers_write_result = smem_int4 >= write_result_int4;
+
+    // s_out is copied into the pipeline area before thread_block_reduce() reuses sh[] as scratch.
+    static constexpr bool reduce_before_s_out =
+        !use_s_out || reduce_int4 <= s_out_offset_int4;
+
+    static_assert(covers_pipeline, "Marlin shared memory must cover the fetch pipeline");
+    static_assert(covers_reduce, "Marlin shared memory must cover thread_block_reduce scratch");
+    static_assert(covers_global_reduce, "Marlin shared memory must cover global_reduce scratch");
+    static_assert(covers_write_result, "Marlin shared memory must cover write_result scratch");
+    static_assert(reduce_before_s_out, "Marlin reduction scratch overlaps pending s_out copy");
+};
 
 // --- Type Traits for Template Dispatch ---
 template<typename T> struct MarlinTraits;
@@ -227,6 +295,14 @@ __device__ inline void Marlin_impl(
 ) {
     using Traits = MarlinTraits<T>;
     using TVec2 = typename Traits::Vec2;
+    using Smem = MarlinSharedMemLayout<
+        threads, thread_m_blocks, thread_n_blocks, thread_k_blocks, stages, use_s_in, use_s_out>;
+
+    static_assert(
+        Smem::covers_pipeline && Smem::covers_reduce &&
+        Smem::covers_global_reduce && Smem::covers_write_result,
+        "Marlin shared memory allocation is smaller than kernel scratch usage");
+    static_assert(Smem::reduce_before_s_out, "Marlin reduction scratch overlaps pending s_out copy");
 
     int parallel = 1;
     if (prob_m > 16 * thread_m_blocks) {
@@ -284,33 +360,33 @@ __device__ inline void Marlin_impl(
     init_slice();
 
     int a_gl_stride = prob_k / 8;
-    constexpr int a_sh_stride = 16 * thread_k_blocks / 8;
-    constexpr int a_gl_rd_delta_o = 16 * thread_k_blocks / 8;
+    constexpr int a_sh_stride = Smem::a_sh_stride;
+    constexpr int a_gl_rd_delta_o = Smem::a_sh_stride;
     int a_gl_rd_delta_i = a_gl_stride * (threads / a_gl_rd_delta_o);
     constexpr int a_sh_wr_delta = a_sh_stride * (threads / a_gl_rd_delta_o);
     constexpr int a_sh_rd_delta_o = 2 * ((threads / 32) / (thread_n_blocks / 4));
     constexpr int a_sh_rd_delta_i = a_sh_stride * 16;
-    constexpr int a_sh_stage = a_sh_stride * (16 * thread_m_blocks);
+    constexpr int a_sh_stage = Smem::a_sh_stage;
     constexpr int a_sh_wr_iters = ceildiv(a_sh_stage, a_sh_wr_delta);
     
     int b_gl_stride = prob_n / 8;
-    constexpr int b_sh_stride = 32 * thread_n_blocks / 4;
-    constexpr int true_b_sh_stride = 2 * thread_n_blocks;
+    constexpr int b_sh_stride = Smem::b_sh_stride;
+    constexpr int true_b_sh_stride = Smem::true_b_sh_stride;
     int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks;
     int b_gl_rd_delta_i = b_gl_stride * (threads / true_b_sh_stride);
     constexpr int b_sh_wr_delta = threads;
     constexpr int b_sh_rd_delta = threads;
     constexpr int b_sh_stage = b_sh_stride * thread_k_blocks;
-    constexpr int true_b_sh_stage = true_b_sh_stride * thread_k_blocks;
+    constexpr int true_b_sh_stage = Smem::true_b_sh_stage;
     constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
     constexpr int true_b_sh_wr_iters = ceildiv(true_b_sh_stage, b_sh_wr_delta);
 
-    constexpr int s_in_gl_stride = 16 * thread_k_blocks / 8;
-    constexpr int s_in_sh_stride = s_in_gl_stride;
+    constexpr int s_in_gl_stride = Smem::s_in_sh_stride;
+    constexpr int s_in_sh_stride = Smem::s_in_sh_stride;
     constexpr int s_in_sh_rd_delta = 4 * (threads / b_sh_stride);
-    constexpr int s_in_sh_stage = use_s_in ? s_in_sh_stride : 0;
+    constexpr int s_in_sh_stage = Smem::s_in_sh_stage;
     constexpr int s_in_gl_rd_delta = s_in_gl_stride;
-    constexpr int s_out_sh_stride = 16 * thread_n_blocks / 8;
+    constexpr int s_out_sh_stride = Smem::s_out_sh_stride;
 
     int a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
     a_gl_rd += a_gl_rd_delta_o * slice_row;
@@ -360,10 +436,10 @@ __device__ inline void Marlin_impl(
 
     extern __shared__ int4 sh[];
     // Shared memory storage for global fetch pipelines.
-    int4* sh_a = sh;
-    int4* sh_b = sh_a + (stages * a_sh_stage);
-    int4* sh_s_in = sh_b + (stages * true_b_sh_stage);
-    int4* sh_s_out = sh_s_in + (stages * s_in_sh_stage);
+    int4* sh_a = sh + Smem::a_offset_int4;
+    int4* sh_b = sh + Smem::b_offset_int4;
+    int4* sh_s_in = sh + Smem::s_in_offset_int4;
+    int4* sh_s_out = sh + Smem::s_out_offset_int4;
 
     alignas(int4) Vec<TVec2, 4> frag_a[2][thread_m_blocks];
     I1 frag_b_quant[2];
@@ -718,34 +794,9 @@ template <
     const bool use_s_out
 >
 constexpr int marlin_shared_mem_bytes() {
-    constexpr int a_sh_stride = 16 * thread_k_blocks / 8;
-    constexpr int a_sh_stage = a_sh_stride * (16 * thread_m_blocks);
-    constexpr int true_b_sh_stride = 2 * thread_n_blocks;
-    constexpr int true_b_sh_stage = true_b_sh_stride * thread_k_blocks;
-    constexpr int s_in_sh_stage = use_s_in ? (16 * thread_k_blocks / 8) : 0;
-    constexpr int s_out_sh_stage = use_s_out ? (16 * thread_n_blocks / 8) : 0;
-    constexpr int pipeline_int4 = stages * (a_sh_stage + true_b_sh_stage + s_in_sh_stage) + s_out_sh_stage;
-
-    constexpr int b_sh_stride = 32 * thread_n_blocks / 4;
-    constexpr int red_groups = THREADS / b_sh_stride;
-    constexpr int reduce_int4 = red_groups > 1 ? (8 * THREADS - b_sh_stride) : 0;
-
-    constexpr int active_threads = 32 * thread_n_blocks / 4;
-    constexpr int global_reduce_int4 = active_threads * thread_m_blocks * 4;
-
-    constexpr int c_sh_stride = 2 * thread_n_blocks + 1;
-    constexpr int max_writer_warp = thread_n_blocks / 4 - 1;
-    constexpr int max_c_sh_wr = (4 * c_sh_stride) * 7 + 3 + 32 * max_writer_warp;
-    constexpr int max_write_idx = max_c_sh_wr + 8 * 3 + (4 * c_sh_stride) * 8 + 4
-                                  + (thread_m_blocks - 1) * 16 * (4 * c_sh_stride);
-    constexpr int write_result_int4 = (max_write_idx + 4) / 4;
-
-    constexpr int scratch_int4 =
-        reduce_int4 > global_reduce_int4
-            ? (reduce_int4 > write_result_int4 ? reduce_int4 : write_result_int4)
-            : (global_reduce_int4 > write_result_int4 ? global_reduce_int4 : write_result_int4);
-    constexpr int smem_int4 = pipeline_int4 > scratch_int4 ? pipeline_int4 : scratch_int4;
-    return smem_int4 * static_cast<int>(sizeof(int4));
+    return MarlinSharedMemLayout<
+        THREADS, thread_m_blocks, thread_n_blocks, thread_k_blocks, stages, use_s_in, use_s_out
+    >::bytes;
 }
 
 #define CALL_IF(T, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, USE_S_IN, USE_S_OUT) \
