@@ -29,6 +29,8 @@ int marlin_cuda_template(
 
 const int ERR_PROB_SHAPE = 1;
 const int ERR_KERN_SHAPE = 2;
+const int ERR_MAX_PAR = 3;
+const int MARLIN_MIN_MAX_PAR = 32;
 
 // Common check logic
 void marlin_onebit_check_and_alloc(
@@ -46,6 +48,7 @@ void marlin_onebit_check_and_alloc(
     TORCH_CHECK(prob_k == B.size(0) * 16, "k dimension mismatch");
     TORCH_CHECK(!s_in.has_value() || s_in->size(0) == prob_k, "s_in size mismatch");
     TORCH_CHECK(!s_out.has_value() || s_out->size(0) == prob_n, "s_out size mismatch");
+    TORCH_CHECK(max_par >= MARLIN_MIN_MAX_PAR, "max_par must be at least ", MARLIN_MIN_MAX_PAR);
     TORCH_CHECK(workspace.numel() >= prob_n / 128 * max_par, "workspace too small");
 
     // Set to follow A's dtype as is (Half or BFloat16)
@@ -60,7 +63,7 @@ torch::Tensor marlin_onebit_cuda(
     const std::optional<torch::Tensor>& s_out,
     torch::Tensor& workspace) {
 
-    int max_par = 8;
+    int max_par = MARLIN_MIN_MAX_PAR;
     torch::Tensor C;
     marlin_onebit_check_and_alloc(A, B, C, s_in, s_out, workspace, max_par);
 
@@ -89,6 +92,7 @@ torch::Tensor marlin_onebit_cuda(
 
     TORCH_CHECK(err != ERR_PROB_SHAPE, "Problem shape incompatible");
     TORCH_CHECK(err != ERR_KERN_SHAPE, "No kernel implementation found");
+    TORCH_CHECK(err != ERR_MAX_PAR, "max_par must be at least ", MARLIN_MIN_MAX_PAR);
     
     return C;
 }
@@ -99,7 +103,7 @@ torch::Tensor marlin_onebit_meta(
     const std::optional<torch::Tensor>& s_in,
     const std::optional<torch::Tensor>& s_out,
     torch::Tensor& workspace) {
-    int max_par = 8;
+    int max_par = MARLIN_MIN_MAX_PAR;
     torch::Tensor C;
     marlin_onebit_check_and_alloc(A, B, C, s_in, s_out, workspace, max_par);
     return C;

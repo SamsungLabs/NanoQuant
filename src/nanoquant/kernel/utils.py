@@ -18,6 +18,8 @@ import torch.nn.functional as F
 # Lazy import gemlite to avoid hard dependency at import time
 _gemlite = None
 
+MARLIN_MIN_MAX_PAR = 32
+
 
 def _get_gemlite():
     """Lazy-load gemlite to avoid import-time errors with incompatible torch versions."""
@@ -206,8 +208,8 @@ def pack_binary_marlin(
     scale_out = scale_out.reshape(scale_out.numel() // 32, 4, 4, 2)
     scale_out = scale_out.permute(0, 2, 1, 3).reshape(-1).contiguous()
 
-    # Calculate workspace size based on output scale
-    workspace_size = scale_out.numel() // 128 * 16
+    # Match the C++ Marlin lower bound for parallel column slices.
+    workspace_size = scale_out.numel() // 128 * MARLIN_MIN_MAX_PAR
 
     return weight, scale_in, scale_out, workspace_size
 

@@ -121,7 +121,9 @@ template<> struct MarlinTraits<half> {
     static constexpr unsigned ONE_BITS = 0x3c003c00;
     static __device__ __forceinline__ Vec2 make_vec2(float a, float b) { return __halves2half2(__float2half(a), __float2half(b)); }
     static __device__ __forceinline__ Vec2 from_scalars(Scalar a, Scalar b) { return __halves2half2(a, b); }
-    static __device__ __forceinline__ Scalar from_float(float v) { return __float2half(fminf(fmaxf(v, -64504.0f), 64504.0f)); }
+    static constexpr float MAX_FINITE = 65504.0f;
+    // FP16 has a much smaller finite range than the FP32 accumulator, so clamp before narrowing.
+    static __device__ __forceinline__ Scalar from_float(float v) { return __float2half(fminf(fmaxf(v, -MAX_FINITE), MAX_FINITE)); }
     static __device__ __forceinline__ float to_float(Scalar v) { return __half2float(v); }
     static __device__ __forceinline__ Vec2 mul2(Vec2 a, Vec2 b) { return __hmul2(a, b); }
     static __device__ __forceinline__ float get_low_float(Vec2 v) { return __low2float(v); }
@@ -146,6 +148,7 @@ template<> struct MarlinTraits<__nv_bfloat16> {
     static constexpr unsigned ONE_BITS = 0x3f803f80;
     static __device__ __forceinline__ Vec2 make_vec2(float a, float b) { return __halves2bfloat162(__float2bfloat16(a), __float2bfloat16(b)); }
     static __device__ __forceinline__ Vec2 from_scalars(Scalar a, Scalar b) { return __halves2bfloat162(a, b); }
+    // BF16 keeps the FP32 exponent range, so the FP16 overflow clamp is not needed here.
     static __device__ __forceinline__ Scalar from_float(float v) { return __float2bfloat16(v); }
     static __device__ __forceinline__ float to_float(Scalar v) { return __bfloat162float(v); }
     static __device__ __forceinline__ Vec2 mul2(Vec2 a, Vec2 b) { return __hmul2(a, b); }
@@ -767,8 +770,10 @@ __device__ inline void Marlin_impl(
 
 const int ERR_PROB_SHAPE = 1;
 const int ERR_KERN_SHAPE = 2;
+const int ERR_MAX_PAR = 3;
 const int THREADS = 256;
 const int STAGES = 4;
+const int MARLIN_MIN_MAX_PAR = 32;
 
 // --- Kernel Wrappers ---
 template <
@@ -829,7 +834,7 @@ int marlin_cuda_template(
     int tot_m = prob_m;
     int tot_m_blocks = ceildiv(tot_m, 16);
     int pad = 16 * tot_m_blocks - tot_m;
-    max_par = max_par > 32 ? max_par : 32;
+    if (max_par < MARLIN_MIN_MAX_PAR) return ERR_MAX_PAR;
 
     if (sms == -1) {
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
