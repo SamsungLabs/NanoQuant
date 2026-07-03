@@ -1236,12 +1236,13 @@ if __name__ == "__main__":
     else:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name,
-            dtype=dtype,
+            torch_dtype=dtype,
             attn_implementation="sdpa",
             low_cpu_mem_usage=True,
             trust_remote_code=True,
         )
 
+    model.seqlen = args.seqlen
     model.to(device)
     model.eval()
 
